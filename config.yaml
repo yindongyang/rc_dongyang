@@ -1,0 +1,35 @@
+# Notify Service 配置（MVP）
+# 所有字段都有合理默认值，不写也能跑
+
+server:
+  addr: ":8080"
+  shutdown_timeout: "15s"
+
+storage:
+  # 当前仅支持 sqlite；MySQL 适配点已在 internal/store 接口预留
+  driver: "sqlite"
+  dsn: "./data/notify.db"
+
+worker:
+  # 并发处理 in-flight 请求的协程数
+  concurrency: 8
+  # 没任务时的轮询间隔（有任务则连续拉取）
+  poll_interval: "500ms"
+  # Worker 抢到任务后的可见性超时；超时未完成会被看门狗重置为 pending
+  lease_timeout: "60s"
+  # 看门狗扫描间隔
+  reaper_interval: "30s"
+
+retry:
+  # 默认最大尝试次数（业务方可以在请求里覆盖）
+  max_attempts: 8
+  # 退避基数：1s, 2s, 4s, 8s, ... 上限 max_backoff
+  base_backoff: "1s"
+  max_backoff: "1h"
+  # 单次 HTTP 调用超时
+  http_timeout: "10s"
+
+# vendor 短路：连续失败超阈值时，挂起一段时间不再调度
+circuit:
+  fail_threshold: 10
+  cooldown: "1m"
