@@ -107,19 +107,80 @@ created_at, updated_at
 - **429 优先尊重 `Retry-After`**
 
 ### 4.4 Worker 抢占（无需分布式锁）
-MYSQL 没有 `SKIP LOCKED`，用乐观锁：
+MYSQL 没有 `SKIP LOCKED`，用乐观锁。完整时间线如下：
+
+**第一步：扫描（捞出候选任务）**
+```sql
+-- Worker 定期轮询，捞出"到期可投递"的任务
+SELECT id, url, method, headers, body, attempts, max_attempts
+FROM notifications
+WHERE status = 'pending'
+  AND next_retry_at <= NOW()
+ORDER BY next_retry_at ASC
+LIMIT 10
+```
+
+**第二步：抢占（乐观锁，防并发重复执行）**
+```sql
+-- 对扫描到的每个 id，尝试抢占
+-- 同时把 next_retry_at 推到未来，充当"租约"
+UPDATE notifications
+SET status = 'running',
+    next_retry_at = NOW() + INTERVAL 30 SECOND,  -- 租约时间必须 > 单次 HTTP 调用最大耗时（默认超时 10s，租约 30s 留 3 倍余量）
+                                                  -- 若租约到期前任务未完成，看门狗会误判 Worker 崩溃，导致任务被重复执行
+    attempts = attempts + 1,
+    updated_at = NOW()
+WHERE id = ?
+  AND status = 'pending'          -- 防并发：已被别人抢走则 status 已变
+  AND next_retry_at <= NOW()      -- 防并发：已被别人抢走则 next_retry_at 已推到未来
+-- 影响行数 = 1 才算抢到，= 0 说明被别人抢先，直接丢弃
+```
+
+**第三步 A：投递成功**
 ```sql
 UPDATE notifications
-SET status='running', next_retry_at = now + lease_timeout, attempts=attempts+1, updated_at=?
-WHERE id=? AND status='pending' AND next_retry_at<=?
+SET status = 'success',
+    last_status_code = 200,
+    updated_at = NOW()
+WHERE id = ?
 ```
-`UPDATE ... WHERE` 影响行数 = 1 才算抢到。
+
+**第三步 B：投递失败，未达上限 → 退避重试**
+```sql
+-- next_retry_at 从"租约时间"变回"退避结束时间"
+UPDATE notifications
+SET status = 'pending',
+    next_retry_at = NOW() + INTERVAL ? SECOND,  -- base * 2^(attempt-1) + jitter
+    last_error = ?,
+    last_status_code = ?,
+    updated_at = NOW()
+WHERE id = ?
+```
+
+**第三步 C：投递失败，达到上限 / 4xx → 死信**
+```sql
+UPDATE notifications
+SET status = 'dead_letter',
+    last_error = ?,
+    last_status_code = ?,
+    updated_at = NOW()
+WHERE id = ?
+```
+
+**第四步：看门狗（崩溃恢复）**
+```sql
+-- Worker 崩溃后任务卡在 running，租约自然到期
+-- 看门狗定期扫描并回滚
+UPDATE notifications
+SET status = 'pending',
+    updated_at = NOW()
+WHERE status = 'running'
+  AND next_retry_at < NOW()   -- 租约已过期，说明 Worker 可能挂了
+```
 
 **`next_retry_at` 一字段两用**：
 - 任务 `pending` 时：表示**退避结束时间**，Worker 只捞 `next_retry_at <= now` 的任务
-- 任务 `running` 时：表示**租约到期时间**，抢占时推到 `now + lease_timeout`（如 30s），其他 Worker 看到未到期则跳过，防止重复执行
-
-**崩溃恢复**：看门狗定期把 `status='running'` 且 `next_retry_at < now` 的任务回滚为 `pending`，由其他 Worker 重新捡起。
+- 任务 `running` 时：表示**租约到期时间**，抢占时推到 `now + lease_timeout`（如 30s），专供看门狗判断 Worker 是否崩溃（`status='running' AND next_retry_at < now` → 说明 Worker 已失联，回滚为 `pending`）
 
 ### 4.5 防雪崩 / 惊群
 - 退避必加 jitter
@@ -139,10 +200,8 @@ SIGTERM → 不再拉新任务 → 等 in-flight 完成或超时（默认 15s）
 | 幂等 | **DB 唯一索引** | Redis SETNX | 写入低频，多一个组件多一个故障点 |
 | 去重责任 | **交给外部/业务方** | 服务内做 exactly-once | HTTP 上做不到真 exactly-once，假装能做就是骗人 |
 | 重试触发 | **DB 轮询 + next_retry_at 索引** | 时间轮 / 延迟队列 | 索引拉取在 MVP 量级（万级 pending）足够 |
-| 调度并发 | **协程池 + DB 抢占** | 一致性 hash 分片 | 抢占模式天然支持 worker 水平扩容 |
 | 内部协议 | **HTTP + JSON** | gRPC | 业务方语言栈不统一；性能远不是瓶颈 |
 | 配置 | **YAML + 环境变量** | 配置中心 | 一台机器一个文件够用 |
-| 可观测性 | **结构化日志 + 内存计数器** | 全套 OpenTelemetry | MVP 不上链路追踪；预留接口将来接 Otel |
 | 框架 | **标准库 net/http** | gin / echo | 路由就 5 个，没必要 |
 
 ---
