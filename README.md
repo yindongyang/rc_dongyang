@@ -61,7 +61,7 @@
                                                        │ 写入任务（事务 + 唯一索引去重）
                                                        ▼
                                               ┌─────────────────┐
-                                              │     SQLite      │  ← 任务表 / 死信表
+                                              │     MYSQL      │  ← 任务表 / 死信表
                                               └────────┬────────┘
                                                        ▲ 抢占（乐观锁）
                                                        │
@@ -110,7 +110,7 @@ created_at, updated_at
 - **429 优先尊重 `Retry-After`**
 
 ### 4.4 Worker 抢占（无需分布式锁）
-SQLite 没有 `SKIP LOCKED`，用乐观锁：
+MYSQL 没有 `SKIP LOCKED`，用乐观锁：
 ```sql
 UPDATE notifications
 SET status='running', lease_until=?, attempts=attempts+1, updated_at=?
@@ -135,7 +135,6 @@ SIGTERM → 不再拉新任务 → 等 in-flight 完成或超时（默认 15s）
 | 决策 | 选择 | 拒绝的方案 | 理由 |
 |---|---|---|---|
 | 队列 | **DB 当队列** | Kafka / RocketMQ / Redis Streams | MVP 流量未知；DB 有事务可调试；引 MQ 反而带来"DB 与 MQ 状态不一致"的新难题 |
-| 存储 | **SQLite（默认）/ MySQL（可切）** | 直接 MySQL | 评审复现成本最低；接口抽象成 `Store`，切 MySQL 改 DSN 即可 |
 | 幂等 | **DB 唯一索引** | Redis SETNX | 写入低频，多一个组件多一个故障点 |
 | 去重责任 | **交给外部/业务方** | 服务内做 exactly-once | HTTP 上做不到真 exactly-once，假装能做就是骗人 |
 | 重试触发 | **DB 轮询 + next_retry_at 索引** | 时间轮 / 延迟队列 | 索引拉取在 MVP 量级（万级 pending）足够 |
@@ -150,7 +149,7 @@ SIGTERM → 不再拉新任务 → 等 in-flight 完成或超时（默认 15s）
 ## 6. 演进路径
 
 ```
-v1（当前 MVP）：API + SQLite + 单进程 Worker
+v1（当前 MVP）：API + MYSQL + 单进程 Worker
    │ 流量 < 几百 QPS、单地域
    ▼
 v2：MySQL + 多进程 Worker（DB 抢占天然水平扩展）+ vendor 维度限流/熔断
@@ -172,7 +171,7 @@ v4：跨地域双活；归档冷数据到对象存储；接入统一可观测性
 ```bash
 cd rc_dongyang
 go mod tidy
-go run ./cmd/server   # 默认监听 :8080，SQLite 文件 ./data/notify.db
+go run ./cmd/server   # 默认监听 :8080，MYSQL 文件 ./data/notify.db
 ```
 
 **提交一个通知**（外部 API 用 httpbin 模拟）：
@@ -229,7 +228,7 @@ rc_dongyang/
 ├── internal/
 │   ├── config/               # 配置加载
 │   ├── model/                # 任务模型与状态机
-│   ├── store/                # 持久化（SQLite 实现）
+│   ├── store/                # 持久化（MYSQL 实现）
 │   ├── api/                  # HTTP handler
 │   ├── sender/               # HTTP 客户端（含退避策略）
 │   └── worker/               # 调度与抢占
