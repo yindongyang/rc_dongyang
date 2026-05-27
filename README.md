@@ -41,10 +41,6 @@
 | 解析外部 API 业务返回值 | 需求明确不关心；解析意味耦合每个供应商协议，复杂度爆炸 |
 | 严格 exactly-once | HTTP 不可控，"调用成功但响应丢失"不可区分；at-least-once + 幂等 key 是工业界共识（Stripe / SQS 同款） |
 | 模板渲染 / 参数变换 | 业务方自己拼好 Body 再丢过来，避免成为"什么都管的中台" |
-| 调度编排（DAG / 依赖通知） | 那是工作流引擎的职责 |
-| 持有外部 API 凭证 | 业务方自己塞 Header；本服务零凭据，降低安全面 |
-| 多租户 / 限流隔离 | MVP 假设内部可信调用；演进时再加 |
-| 复杂熔断器框架（Hystrix/Sentinel） | 简单"vendor 维度连续失败短路"已够 |
 | 消息队列 | DB 当队列在 < 1k QPS 完全够用，少一个组件少一份故障源（详见 §5）|
 
 ---
@@ -96,7 +92,8 @@
 id, biz_system, biz_id, idempotency_key,
 url, method, headers(JSON), body,
 status, attempts, max_attempts,
-next_retry_at, last_error, last_status_code,
+next_retry_at,   -- 身兼两职：pending 时=退避结束时间；running 时=租约到期时间
+last_error, last_status_code,
 created_at, updated_at
 唯一索引: (biz_system, biz_id)
 普通索引: (status, next_retry_at)
@@ -113,12 +110,16 @@ created_at, updated_at
 MYSQL 没有 `SKIP LOCKED`，用乐观锁：
 ```sql
 UPDATE notifications
-SET status='running', lease_until=?, attempts=attempts+1, updated_at=?
+SET status='running', next_retry_at = now + lease_timeout, attempts=attempts+1, updated_at=?
 WHERE id=? AND status='pending' AND next_retry_at<=?
 ```
 `UPDATE ... WHERE` 影响行数 = 1 才算抢到。
 
-**可见性超时（lease）**：抢到任务后立刻把 `next_retry_at` 推到 `now + lease_timeout`，防 Worker 崩溃任务卡住。看门狗定期把 `running` 且 `lease_until < now` 的任务回滚为 `pending`。
+**`next_retry_at` 一字段两用**：
+- 任务 `pending` 时：表示**退避结束时间**，Worker 只捞 `next_retry_at <= now` 的任务
+- 任务 `running` 时：表示**租约到期时间**，抢占时推到 `now + lease_timeout`（如 30s），其他 Worker 看到未到期则跳过，防止重复执行
+
+**崩溃恢复**：看门狗定期把 `status='running'` 且 `next_retry_at < now` 的任务回滚为 `pending`，由其他 Worker 重新捡起。
 
 ### 4.5 防雪崩 / 惊群
 - 退避必加 jitter
